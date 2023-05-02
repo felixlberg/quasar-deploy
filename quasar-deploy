@@ -1,0 +1,452 @@
+#!/bin/bash
+set -e
+
+# check the bash shell script is being run by root
+if (( $EUID != 0 )); then
+    echo "Please run as root"
+    exit
+fi
+
+############################################################
+# Help                                                     #
+############################################################
+HELP="$(basename $0) Syntax-->[-hvcd] [-p DEPLOY_DIR ] [-i PROJECT_ID] [-nxr]
+Download and extract new deployments of quasar v2.0 webapps from gitlab and deploy them.
+where:
+    -h  Show this help text (optional | exit script).
+
+    -v  Display verbose info (optional | set at first to show all verbose info).
+
+    -c  Clean old deployments (optional).
+        Delete old deployments and keep the last 10, if -p is not set path is: /var/www/html.
+
+    -d  Developing enviroment (optional).
+        Set quasar build to -d and symbolic link to dev-spa.
+
+    -t  Personal acces token.
+        Your personal access token for the gitlab api
+
+    -p  Deployment domain as FQDN (optional | must set before -i).
+        Set deployment directory as as argument, use FQDN e.g. example.com.
+        Must set before -i (gitlab project ID) otherwise script cannot deploy.
+
+    -u  Set API_BASE_URL in .env file.
+        Set the url for your api. Default is 'http//:localhost:3000'.
+        Must set before -i (gitlab project ID) otherwise script cannot deploy.
+
+    -i  Gitlab project ID (mandatory exept when using -x).
+        Set gitlab project id which can be found at project main page.
+        If -b is not given, script tries to retrieve old password from [deploy-directory]/rollback (file must not be empty).
+
+    -n  Configure nginx ( optional | must have -p set as FQDN and A record pointing to server ).
+        Will configure nginx and download letsencrypt certificate.
+        Can run without other arguments but -p musst be given as FQDN.
+
+    -x  Rollback to last deployment (optional).
+        The last 10 deployments are stored in [deploy-directory]/rollback (file must not be empty).
+
+    -r  Reload nginx (optional | always add at last)
+        Usually its not nessecary to reload nginx after symling has changed."
+
+############################################################
+# Main program                                             #
+############################################################
+
+# Generate dates and random strings
+DATE=$(date +%b-%d-%y)
+DB_PW=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9!#$%&?' | head -c 30)
+RAN_NUM=$(cat /dev/urandom | tr -dc '0-9' | head -c 5)
+
+# Set variables
+DEPLOY_DIR=/var/www/html
+ENV=production
+VERBOSE=false
+DB="$RAN_NUM"
+MAX_DIRS=10 # Maximum direcories for cleaning
+API_BASE_URL=http//:localhost:3000 # Default API URL
+
+# Nginx final config
+NGINX_CONF_FINAL=$(cat <<'EOF'
+server {
+    listen 80;
+
+    server_name DOMAIN;
+
+    rewrite ^/(.*) https://DOMAIN/$1 permanent;
+}
+
+server {
+        listen 443 ssl http2;
+
+        root /var/www/DOMAIN/live;
+
+        index index.html;
+
+        server_name DOMAIN;
+
+        ssl_certificate /etc/letsencrypt/live/DOMAIN/fullchain.pem;
+        ssl_certificate_key /etc/letsencrypt/live/DOMAIN/privkey.pem;
+        include /etc/letsencrypt/options-ssl-nginx.conf;
+        ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+        gzip on;
+        gzip_types
+          text/css
+          text/javascript
+          image/svg+xml
+          application/vnd.ms-fontobject
+          application/x-font-ttf
+          application/x-javascript
+          application/javascript;
+
+        # set expiration of assets to MAX for caching
+        location ~* \.(ico|css|js|gif|jpe?g|png)(\?[0-9]+)?$ {
+                expires max;
+                log_not_found off;
+        }
+
+        location / {
+           try_files $uri $uri/ /index.html;
+        }
+
+        location ~ /\. {
+            deny all;
+        }
+}
+EOF
+);
+
+############################################################
+# Process the input options. Add options as needed.        #
+############################################################
+Reload()
+{
+  # check the bash shell script is being run by root
+  if (( $EUID != 0 )); then
+      echo "Please run as root if you want restart nginx"
+      exit
+  fi
+
+  # Restart nginx
+  nginx -s reload
+
+  # Verbose info
+  if [ "$VERBOSE" = "true" ] ; then
+    echo
+    echo "Reloaded nginx"
+    echo
+  fi
+}
+
+Deployment()
+{
+  # Mandatory arguments
+  if [ ! "$PROJECT_ID" ]; then
+    echo "ERROR: option -i must be provided with arguments"
+    echo "$HELP" >&2; exit 1
+  fi
+
+  if [ ! "$PROJECT_ID" ]; then
+    echo "ERROR: option -i must be provided with arguments"
+    echo "$HELP" >&2; exit 1
+  fi
+
+  # Generate nvm path
+  export NVM_DIR=/home/nodejs/.nvm
+  [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+  [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
+
+  # Verbose info
+  if [ "$VERBOSE" = "true" ] ; then
+    echo "############################################################"
+    echo "DEPLOYMENT                                                 #"
+    echo "############################################################"
+  fi
+
+  # Create deploy directories
+  mkdir -p "$DEPLOY_DIR/deploy-$RAN_NUM"
+  NEW_DEPLOY="$DEPLOY_DIR/deploy-$RAN_NUM"
+
+  # Download repo
+  if [ ! "$TOKEN" ]; then
+    echo "ERROR: option -t must be provided with arguments"
+    echo "$HELP" >&2; exit 1
+  fi
+
+  PROJECT_URL=https://gitlab.com/api/v4/projects/"$PROJECT_ID"/repository/archive\?private_token\="$TOKEN"
+
+  # Verbose info
+  if [ "$VERBOSE" = "true" ] ; then
+    # Get project verbose mode
+    echo
+    wget -vO new-deploy.tar.gz "$PROJECT_URL"
+  else
+    # Get project default
+    wget -qO new-deploy.tar.gz "$PROJECT_URL"
+  fi
+
+  # Extract new deploy to deploy path
+  tar -xf new-deploy.tar.gz --strip 1 -C "$NEW_DEPLOY"
+  rm new-deploy.tar.gz
+
+  # Verbose info
+  if [ "$VERBOSE" = "true" ] ; then
+    echo "Path for new deployment-->$NEW_DEPLOY"
+    echo "Download and extract Project-->$PROJECT_ID"
+    echo "Project extracted to-->$NEW_DEPLOY"
+    echo
+    echo "Installing dependencies..."
+  fi
+
+  # Install node_modules
+  npm install --prefix "$NEW_DEPLOY"/
+
+  # Really wierd workaround for pdfmake to add custom fonts,
+  # Read more here: https://pdfmake.github.io/docs/0.1/fonts/custom-fonts-client-side/vfs/
+  # Get gulp conf
+  GULP_CONF="$NEW_DEPLOY/node_modules/pdfmake/gulpfile.js"
+
+  # Write new gulp conf
+  if [ -f "$GULP_CONF" ]
+  then
+    find "$GULP_CONF" -type f -exec sed -i "s#'\./examples/fonts/\*\.\*'#\
+    \n'./../../src/assets/fonts/Helvetica/*',\
+    \n'./../../src/assets/fonts/Roboto/*',\
+    \n'./../../src/assets/img/example_image_1.png',\
+    \n'./../../src/assets/img/example_image_2.png'\n#g" {} \;
+  fi
+
+  # Build gulp fonts
+  gulp buildFonts --gulpfile "$GULP_CONF"
+
+  # Store old symlink in rollback file
+  if [ -L "$DEPLOY_DIR"/live ] ; then
+    OLD_SYMLINK=$(readlink "$DEPLOY_DIR"/live)
+  fi
+
+  # Create rollback file if not existing
+  touch "$DEPLOY_DIR"/rollback
+
+  # Create .env file
+  touch "$NEW_DEPLOY"/.env
+  ENV_FILE="$NEW_DEPLOY"/.env
+
+  # Verbose Info
+  if [ "$VERBOSE" = "true" ] ; then
+    echo
+    echo "Base URL set in .env to: $API_BASE_URL"
+    echo
+  fi
+
+  # Add general .env file settings
+  echo "API_BASE_URL=$API_BASE_URL" > "$ENV_FILE";
+
+  # Check if file has more than 10 lines
+  NUM_OF_LINES=$(< "$DEPLOY_DIR"/rollback wc -l)
+
+  if [ $NUM_OF_LINES -gt $MAX_DIRS ]; then
+    # Delete first line
+    sed -i '1d' "$DEPLOY_DIR"/rollback
+    # Write new deploy dir to rollback
+    printf "$OLD_SYMLINK\n" >> "$DEPLOY_DIR"/rollback
+  elif [ -L "$DEPLOY_DIR"/live ] ; then
+    # Write new deploy dir to rollback
+    printf "$OLD_SYMLINK\n" >> "$DEPLOY_DIR"/rollback
+  fi
+
+  # Quasar build according to dev variable
+  if [ "$DEV" = "true" ] ; then
+    # Quasar build
+    cd "$NEW_DEPLOY" && quasar build -d
+    # Link new deploy
+    if [ -L "$DEPLOY_DIR"/live ] ; then
+      rm "$DEPLOY_DIR"/live
+    fi
+    cd "$DEPLOY_DIR" && ln -sr deploy-"$RAN_NUM"/dist/spa-dev live
+    chown -h root:www-data "$DEPLOY_DIR"/live
+  else
+    # Quasar build
+    cd "$NEW_DEPLOY" && quasar build
+    # Link new deploy
+    if [ -L "$DEPLOY_DIR"/live ] ; then
+      rm "$DEPLOY_DIR"/live
+    fi
+    cd "$DEPLOY_DIR" &&  ln -sr deploy-"$RAN_NUM"/dist/spa live
+    chown -h root:www-data "$DEPLOY_DIR"/live
+  fi
+
+  # Set owner
+  chown -R root:www-data "$NEW_DEPLOY"
+
+  # Set permissions
+  find "$NEW_DEPLOY" -type d -exec chmod g-s {} \;
+  find "$NEW_DEPLOY" -type d -exec chmod 600 {} \;
+  find "$NEW_DEPLOY" -type f -exec chmod 600 {} \;
+  find "$NEW_DEPLOY"/dist -type d -exec chmod 750 {} \;
+  find "$NEW_DEPLOY"/dist -type f -exec chmod 640 {} \;
+  chmod 750 "$NEW_DEPLOY"
+
+  # Verbose Info
+  if [ "$VERBOSE" = "true" ] ; then
+    echo
+    echo "Base URL set in .env to: $API_BASE_URL"
+    echo
+    echo "Old Symlink stored to rollback file: $DEPLOY_DIR/live"
+    echo "New symlink created to-->$(readlink -f $DEPLOY_DIR/live)"
+    echo "Permissions set-->"
+    ls -al "$NEW_DEPLOY"
+    echo
+  fi
+
+  # Clean function
+  if [ "$CLEAN" = "true" ] ; then
+
+    # add one to max_dirs to skip first deploy which isn't in rollback file
+    CLEAN_DIRS=$(($MAX_DIRS+1))
+
+    # Verbose Info
+    if [ "$VERBOSE" = "true" ] ; then
+      echo "############################################################"
+      echo "CLEANING                                                   #"
+      echo "############################################################"
+      echo
+      echo "Old deployments deleted-->"
+      find "$DEPLOY_DIR" -maxdepth 1 -type d -name "deploy*" -printf '%T@\t%p\n' | sort -t $'\t' -g | head -n -"$CLEAN_DIRS" | cut -d $'\t' -f 2- | xargs ls -d1
+      echo
+    fi
+
+    # Find old deploys and delete them
+    find "$DEPLOY_DIR" -maxdepth 1 -type d -name "deploy*" -printf '%T@\t%p\n' | sort -t $'\t' -g | head -n -"$CLEAN_DIRS" | cut -d $'\t' -f 2- | xargs rm -rf
+
+    # Check if rollback file exists
+    if [ -s "$DEPLOY_DIR"/rollback ]; then
+      # Check if file has more than X lines
+      NUM_OF_LINES=$(< "$DEPLOY_DIR"/rollback wc -l)
+      # Delete first line of rollback file
+      if [ "$NUM_OF_LINES" -gt "$MAX_DIRS" ]; then
+        # Delete first line
+        sed -i '1d' "$DEPLOY_DIR"/rollback
+      fi
+    fi
+
+  fi
+}
+
+Nginx()
+{
+  # Verbose info
+  if [ "$VERBOSE" = "true" ] ; then
+    echo "############################################################"
+    echo "NGINX CONFIG                                               #"
+    echo "############################################################"
+  fi
+
+  # Check if nessecary options are set
+  if  [ ! "$DOMAIN" ]; then
+    echo "Option -p must be provided with FQDN when using configure nginx"
+    echo "$HELP" >&2; exit 1
+  fi
+
+  # Check if vhost or not
+  if [ "$DEPLOY_DIR" != "/var/www/html" ] ; then
+    # Set nginx conf path for vhost
+    touch /etc/nginx/sites-available/"$DOMAIN"
+    NGINX_CONF=/etc/nginx/sites-available/"$DOMAIN"
+    # Enable site if not default
+    ln -s "$NGINX_CONF" /etc/nginx/sites-enabled/
+  fi
+
+  # Run certbot
+  certbot certonly --nginx --noninteractive --agree-tos -d "$DOMAIN" --register-unsafely-without-email
+
+  # Write  conf to nginx
+  echo "$NGINX_CONF_FINAL" > "$NGINX_CONF"
+  find "$NGINX_CONF" -type f -exec sed -i 's/DOMAIN/'"$DOMAIN"'/g' {} \;
+
+  # Restart nginx
+  Reload
+}
+
+Rollback()
+{
+  # Verbose Info
+  if [ "$VERBOSE" = "true" ] ; then
+    echo "############################################################"
+    echo "Rollback                                                   #"
+    echo "############################################################"
+  fi
+
+  # Check for rollbacks
+  if [ -s "$DEPLOY_DIR"/rollback ]; then
+
+    # Get value of both symlinks
+    NEW_DEPLOY=$(readlink "$DEPLOY_DIR"/live)
+    OLD_DEPLOY=$(tail -n 1 "$DEPLOY_DIR"/rollback)
+
+    # Delete old symlink and create new
+    rm "$DEPLOY_DIR"/live
+    cd "$DEPLOY_DIR" && ln -s "$OLD_DEPLOY" live
+    chown -h root:www-data "$DEPLOY_DIR"/live
+
+    # Delete new deploy
+    rm -rf "$NEW_DEPLOY"
+
+    # Delete last line in rollback file
+    tail -n 1 "$DEPLOY_DIR"/rollback | wc -c | xargs -I {} truncate "$DEPLOY_DIR"/rollback -s -{}
+
+    # Verbose Info
+    if [ "$VERBOSE" = "true" ] ; then
+      echo
+      echo "New symlink to last deployment-->$OLD_DEPLOY"
+      echo "Deleted newest deployment-->$NEW_DEPLOY"
+      echo
+    fi
+
+  else
+
+    # Show error message and exit script
+    echo "ERROR: rollback file empty!"
+    exit
+
+  fi
+
+  # check if rollback file is empty after rollback
+  if [ -s "$DEPLOY_DIR"/rollback ]; then
+    # Delete rollback file cause its empty
+    rm "$DEPLOY_DIR"/rollback
+  fi
+
+}
+
+# Get the options
+while getopts ":hvc:dp:u:i:nxr" option; do
+   case ${option} in
+      h) # display Help
+        echo "$HELP"; exit;;
+      v) # verbose
+        VERBOSE=true;;
+      c) # clean old deployments
+        MAX_DIRS=$OPTARG; CLEAN=true;;
+      d) # choose development
+        DEV=true;;
+      t) # choose api token
+        TOKEN=$OPTARG;;
+      p) # enter path for vhost enviroment e.g. example.com
+        DOMAIN=$OPTARG; DEPLOY_DIR="/var/www/$DOMAIN";;
+      u) # enter base url for api
+        API_BASE_URL=$OPTARG;;
+      i) # choose project ID in gitlab
+        PROJECT_ID=$OPTARG; Deployment;;
+      n) # Configure nginx
+        Nginx;;
+      x) # rollback
+        PROJECT_ID=null; ROLLBACK=true; Rollback;;
+      r) # reload nginx
+        Reload;;
+     \?) # Invalid option
+        echo "Error: Invalid option"; exit;;
+   esac
+done
+
+# Shift to next argument
+shift "$((OPTIND - 1))"
